@@ -166,6 +166,9 @@ class BLEDOMInstance:
         self._device: BLEDevice | None = None
         self._device_data: DeviceData | None = None
         self._connect_lock: asyncio.Lock = asyncio.Lock()
+        # Foreground requests get priority at boundaries between background
+        # BLE attempts, without cancelling an in-flight ESPHome connection.
+        self._foreground_waiters = 0
         # Every platform entity shares this instance.  Serialize their writes
         # so light, effect-speed, and microphone commands cannot interleave.
         self._command_lock: asyncio.Lock = asyncio.Lock()
@@ -652,8 +655,30 @@ class BLEDOMInstance:
             track = traceback.format_exc()
             LOGGER.debug(track)
         
-    async def _ensure_connected(self) -> None:
-        """Ensure connection to device is established."""
+    async def _ensure_connected(self, *, background: bool = False) -> None:
+        """Connect, giving interactive commands priority over background retries.
+
+        Background attempts intentionally use one transport attempt each;
+        interactive calls retain the connector's standard retry behavior.
+        Never cancel an in-flight BLE connection to preempt it: doing so can
+        leave a proxy connection slot occupied until timeout.
+        """
+        if not background:
+            self._foreground_waiters += 1
+        try:
+            await self._connect_once(background=background)
+        finally:
+            if not background:
+                self._foreground_waiters -= 1
+
+    async def _connect_once(self, *, background: bool) -> None:
+        """Perform serialized Bluetooth connection and GATT setup."""
+        if background and self._foreground_waiters:
+            LOGGER.debug(
+                "%s: Foreground command pending; skipping background BLE attempt",
+                self.name,
+            )
+            return
         if self._connect_lock.locked():
             LOGGER.debug(
                 "%s: Connection already in progress, waiting for it to complete; RSSI: %s",
@@ -664,6 +689,14 @@ class BLEDOMInstance:
             self._reset_disconnect_timer()
             return
         async with self._connect_lock:
+            # A foreground command may have queued while the background
+            # worker waited to acquire the shared connection lock.
+            if background and self._foreground_waiters:
+                LOGGER.debug(
+                    "%s: Foreground command waiting; yielding background BLE attempt",
+                    self.name,
+                )
+                return
             # Check again while holding the lock
             if self._client and self._client.is_connected:
                 self._reset_disconnect_timer()
@@ -693,6 +726,9 @@ class BLEDOMInstance:
                     ble_device_callback=lambda: async_ble_device_from_address(
                         self._hass, self._address, connectable=True
                     ) or self._device,
+                    # One attempt per background pass prevents up to four
+                    # transport attempts from blocking a waiting light command.
+                    **({"max_attempts": 1} if background else {}),
                 )
             except Exception:
                 LOGGER.debug(
@@ -959,9 +995,16 @@ class BLEDOMInstance:
             for attempt in range(1, BACKGROUND_RECONNECT_ATTEMPTS + 1):
                 if self._stopping:
                     return
+                if self._foreground_waiters:
+                    LOGGER.debug(
+                        "%s: Foreground command pending; ending background retry cycle",
+                        self.name,
+                    )
+                    return
                 try:
-                    # Foreground commands and this worker share _connect_lock.
-                    await self._ensure_connected()
+                    # Each background pass makes just one underlying BLE
+                    # connection attempt. The lock is released between passes.
+                    await self._ensure_connected(background=True)
                     if self._client and self._client.is_connected:
                         LOGGER.debug("%s: Background BLE connection restored", self.name)
                         return
@@ -974,6 +1017,12 @@ class BLEDOMInstance:
                         error, exc_info=True,
                     )
 
+                if self._foreground_waiters:
+                    LOGGER.debug(
+                        "%s: Foreground command waiting; handing off BLE connection",
+                        self.name,
+                    )
+                    return
                 if attempt < BACKGROUND_RECONNECT_ATTEMPTS:
                     delay = min(
                         BACKGROUND_RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
