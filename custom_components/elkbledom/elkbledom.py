@@ -714,7 +714,13 @@ class BLEDOMInstance:
                 )
 
             connect_start = self.loop.time()
-            LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
+            LOGGER.debug(
+                "%s: Connecting; RSSI: %s; mode=%s; max_attempts=%s",
+                self.name,
+                self.rssi,
+                "background" if background else "foreground",
+                1 if background else "default",
+            )
             # Let connection errors reach the command's retry decorator.
             try:
                 client = await establish_connection(
