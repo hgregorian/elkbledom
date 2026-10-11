@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import traceback
 import logging
+from contextlib import suppress
 from typing import Any, TypeVar, cast, Tuple, Optional, Dict, List
 from collections.abc import Callable
 from homeassistant.exceptions import ConfigEntryNotReady
@@ -25,6 +26,11 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_ATTEMPTS = 3
 #DISCONNECT_DELAY = 120
 BLEAK_BACKOFF_TIME = 0.25
+# One bounded, managed reconnect worker per device. Only used when the
+# configured disconnect delay is 0 (persistent-connection mode).
+BACKGROUND_RECONNECT_ATTEMPTS = 5
+BACKGROUND_RECONNECT_BASE_DELAY = 5
+BACKGROUND_RECONNECT_MAX_DELAY = 60
 # Connection timeouts need the same retry treatment as explicit Bluetooth
 # transport errors.  Previously a timeout was swallowed by _ensure_connected,
 # which allowed the caller to continue with no usable client.
@@ -167,6 +173,9 @@ class BLEDOMInstance:
         self._disconnect_timer: asyncio.TimerHandle | None = None
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
+        self._stopping = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._timed_disconnect_task: asyncio.Task | None = None
         self._is_on = None
         self._rgb_color = None
         self._rgb_color_base = (255, 255, 255)  # Base RGB without brightness scaling
@@ -202,6 +211,8 @@ class BLEDOMInstance:
         if not self._device:
             raise ConfigEntryNotReady(f"You need to add bluetooth integration (https://www.home-assistant.io/integrations/bluetooth) or couldn't find a nearby device with address: {address}")
 
+        # Keep the discovered name even if a refreshed BLEDevice has no name.
+        self._device_name = self._device.name or self._address
         # self._adv_data: AdvertisementData | None = None
         self._detect_model()
         LOGGER.debug('Model information for device %s : ModelNo %s, Turn on cmd %s, Turn off cmd %s, rssi %s', 
@@ -274,9 +285,16 @@ class BLEDOMInstance:
             self.name,
             " ".join(f"{value:02x}" for value in data),
         )
-        await self._client.write_gatt_char(
-            self._write_uuid, data, response=False
-        )
+        write_start = self.loop.time()
+        try:
+            await self._client.write_gatt_char(
+                self._write_uuid, data, response=False
+            )
+        finally:
+            LOGGER.debug(
+                "%s: BLE write took %.2fs", self.name,
+                self.loop.time() - write_start,
+            )
 
     @property
     def address(self):
@@ -288,7 +306,7 @@ class BLEDOMInstance:
 
     @property
     def name(self):
-        return self._device.name
+        return self._device.name or self._device_name
 
     @property
     def rssi(self):
@@ -651,117 +669,168 @@ class BLEDOMInstance:
                 self._reset_disconnect_timer()
                 return
 
-            LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
-            # Let connection errors reach the command's retry decorator so a
-            # transient timeout is retried and logged at the appropriate level.
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                self._device,
-                self.name,
-                self._disconnected,
-                cached_services=self._cached_services,
-                ble_device_callback=lambda: self._device,
+            refreshed_device = async_ble_device_from_address(
+                self._hass, self._address, connectable=True
             )
-
-            LOGGER.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
-            
-            # Execute login command BEFORE resolving characteristics for MELK/MODELX devices
-            # These devices disconnect if login is not performed first
-            if self._device.name.lower().startswith("melk") or self._device.name.lower().startswith("modelx"):
-                LOGGER.debug("%s: Executing login procedure before service discovery; RSSI: %s", self.name, self.rssi)
-                try:
-                    # Get services to find write UUID for login
-                    temp_services = None
-                    try:
-                        temp_services = client.services
-                    except (AttributeError, Exception):
-                        try:
-                            temp_services = await client.get_services()
-                        except (AttributeError, Exception) as e:
-                            LOGGER.error("%s: Failed to get services: %s", self.name, e)
-                            raise
-                    
-                    temp_write_uuid = None
-                    
-                    # Find write characteristic for login
-                    write_uuid = self._model.get_write_uuid(self._model_name)
-                    if write_uuid and (char := temp_services.get_characteristic(write_uuid)):
-                        temp_write_uuid = str(char.uuid)  # Ensure it's a string
-                        LOGGER.debug("%s: Found write UUID for login: %s", self.name, temp_write_uuid)
-                    
-                    if temp_write_uuid:
-                        LOGGER.info("%s: Executing login sequence...", self.name)
-                        await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x07, 0x83]), response=False)
-                        await asyncio.sleep(1)
-                        await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x04, 0x04]), response=False)
-                        await asyncio.sleep(1)
-                        LOGGER.info("%s: Login sequence completed", self.name)
-                    else:
-                        LOGGER.warning("%s: Could not find write UUID for login procedure", self.name)
-                except Exception as e:
-                    LOGGER.error("%s: Login procedure failed: %s", self.name, e)
-                    # Continue anyway, might work for some devices
-            
-            # Try to get services with fallback
-            services_obj = None
-            try:
-                services_obj = client.services
-            except (AttributeError, Exception):
-                try:
-                    services_obj = await client.get_services()
-                except (AttributeError, Exception) as e:
-                    LOGGER.error("%s: Failed to get services: %s", self.name, e)
-                    await client.disconnect()
-                    raise
-            
-            resolved = self._resolve_characteristics(services_obj)
-            if not resolved:
-                # Try to handle services failing to load
-                try:
-                    # Try alternate method
-                    alt_services = None
-                    try:
-                        alt_services = await client.get_services()
-                    except (AttributeError, Exception):
-                        try:
-                            alt_services = client.services
-                        except (AttributeError, Exception) as e:
-                            LOGGER.warning("%s: Could not get services with either method: %s", self.name, e)
-                            raise
-                    
-                    if alt_services:
-                        resolved = self._resolve_characteristics(alt_services)
-                        self._cached_services = alt_services if resolved else None
-                except (AttributeError, Exception) as error:
-                    LOGGER.warning("%s: Could not resolve characteristics from services; RSSI: %s", self.name, self.rssi)
+            if refreshed_device is not None:
+                self._device = refreshed_device
             else:
-                self._cached_services = services_obj if resolved else None
-            
-            if not resolved:
-                await client.clear_cache()
-                await client.disconnect()
-                raise CharacteristicMissingError(
-                    "Failed to find supported characteristics, device may not be supported"
+                LOGGER.debug(
+                    "%s: No current connectable BLEDevice; using last known adapter",
+                    self.name,
                 )
 
-            LOGGER.debug("%s: Characteristics resolved: %s; RSSI: %s", self.name, resolved, self.rssi)
-
-            self._client = client
-            self._reset_disconnect_timer()
-
-            # Enable notifications (simple method, no manual CCCD)
+            connect_start = self.loop.time()
+            LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
+            # Let connection errors reach the command's retry decorator.
             try:
-                if not self._device.name.lower().startswith("melk") and not self._device.name.lower().startswith("ledble"):
-                    if self._read_uuid is not None and isinstance(self._read_uuid, str) and self._read_uuid.lower() != "none":
-                        LOGGER.debug("%s: Enabling notifications; RSSI: %s", self.name, self.rssi)
-                        await client.start_notify(self._read_uuid, self._notification_handler)
-                        LOGGER.info("%s: Notifications enabled", self.name)
-                    else:
-                        LOGGER.warning("%s: Read UUID not resolved (value: %s), skipping notifications", self.name, self._read_uuid)
-            except Exception as e:
-                LOGGER.warning("%s: Notifications could not be enabled: %s", self.name, e)
+                client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    self._device,
+                    self.name,
+                    self._disconnected,
+                    cached_services=self._cached_services,
+                    ble_device_callback=lambda: async_ble_device_from_address(
+                        self._hass, self._address, connectable=True
+                    ) or self._device,
+                )
+            except Exception:
+                LOGGER.debug(
+                    "%s: BLE establishment failed after %.2fs",
+                    self.name, self.loop.time() - connect_start, exc_info=True,
+                )
+                raise
 
+            connect_elapsed = self.loop.time() - connect_start
+            gatt_start = self.loop.time()
+            LOGGER.debug(
+                "%s: BLE link established in %.2fs; RSSI: %s",
+                self.name, connect_elapsed, self.rssi,
+            )
+            
+            try:
+                # Execute login command BEFORE resolving characteristics for MELK/MODELX devices
+                # These devices disconnect if login is not performed first
+                if self.name.lower().startswith("melk") or self.name.lower().startswith("modelx"):
+                    LOGGER.debug("%s: Executing login procedure before service discovery; RSSI: %s", self.name, self.rssi)
+                    try:
+                        # Get services to find write UUID for login
+                        temp_services = None
+                        try:
+                            temp_services = client.services
+                        except (AttributeError, Exception):
+                            try:
+                                temp_services = await client.get_services()
+                            except (AttributeError, Exception) as e:
+                                LOGGER.error("%s: Failed to get services: %s", self.name, e)
+                                raise
+                    
+                        temp_write_uuid = None
+                    
+                        # Find write characteristic for login
+                        write_uuid = self._model.get_write_uuid(self._model_name)
+                        if write_uuid and (char := temp_services.get_characteristic(write_uuid)):
+                            temp_write_uuid = str(char.uuid)  # Ensure it's a string
+                            LOGGER.debug("%s: Found write UUID for login: %s", self.name, temp_write_uuid)
+                    
+                        if temp_write_uuid:
+                            LOGGER.info("%s: Executing login sequence...", self.name)
+                            await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x07, 0x83]), response=False)
+                            await asyncio.sleep(1)
+                            await client.write_gatt_char(temp_write_uuid, bytes([0x7e, 0x04, 0x04]), response=False)
+                            await asyncio.sleep(1)
+                            LOGGER.info("%s: Login sequence completed", self.name)
+                        else:
+                            LOGGER.warning("%s: Could not find write UUID for login procedure", self.name)
+                    except Exception as e:
+                        LOGGER.error("%s: Login procedure failed: %s", self.name, e)
+                        # Continue anyway, might work for some devices
+            
+                # Try to get services with fallback
+                services_obj = None
+                try:
+                    services_obj = client.services
+                except (AttributeError, Exception):
+                    try:
+                        services_obj = await client.get_services()
+                    except (AttributeError, Exception) as e:
+                        LOGGER.error("%s: Failed to get services: %s", self.name, e)
+                        await client.disconnect()
+                        raise
+            
+                resolved = self._resolve_characteristics(services_obj)
+                if not resolved:
+                    # Try to handle services failing to load
+                    try:
+                        # Try alternate method
+                        alt_services = None
+                        try:
+                            alt_services = await client.get_services()
+                        except (AttributeError, Exception):
+                            try:
+                                alt_services = client.services
+                            except (AttributeError, Exception) as e:
+                                LOGGER.warning("%s: Could not get services with either method: %s", self.name, e)
+                                raise
+                    
+                        if alt_services:
+                            resolved = self._resolve_characteristics(alt_services)
+                            self._cached_services = alt_services if resolved else None
+                    except (AttributeError, Exception) as error:
+                        LOGGER.warning("%s: Could not resolve characteristics from services; RSSI: %s", self.name, self.rssi)
+                else:
+                    self._cached_services = services_obj if resolved else None
+            
+                if not resolved:
+                    await client.clear_cache()
+                    await client.disconnect()
+                    raise CharacteristicMissingError(
+                        "Failed to find supported characteristics, device may not be supported"
+                    )
 
+                LOGGER.debug(
+                    "%s: GATT characteristics resolved in %.2fs (success=%s)",
+                    self.name, self.loop.time() - gatt_start, resolved,
+                )
+
+                self._client = client
+                self._reset_disconnect_timer()
+
+                # Enable notifications (simple method, no manual CCCD)
+                notify_start = self.loop.time()
+                try:
+                    if not self.name.lower().startswith("melk") and not self.name.lower().startswith("ledble"):
+                        if self._read_uuid is not None and isinstance(self._read_uuid, str) and self._read_uuid.lower() != "none":
+                            LOGGER.debug("%s: Enabling notifications; RSSI: %s", self.name, self.rssi)
+                            await client.start_notify(self._read_uuid, self._notification_handler)
+                            LOGGER.info("%s: Notifications enabled", self.name)
+                        else:
+                            LOGGER.warning("%s: Read UUID not resolved (value: %s), skipping notifications", self.name, self._read_uuid)
+                except Exception as e:
+                    LOGGER.warning("%s: Notifications could not be enabled: %s", self.name, e)
+                finally:
+                    LOGGER.debug(
+                        "%s: BLE ready after %.2fs (link %.2fs, GATT %.2fs, "
+                        "notifications %.2fs)",
+                        self.name, self.loop.time() - connect_start,
+                        connect_elapsed, notify_start - gatt_start,
+                        self.loop.time() - notify_start,
+                    )
+            except BaseException:
+                # If setup is interrupted after BLE connected (particularly by
+                # a cancelled reconnect worker), close it instead of leaving a
+                # stranded active slot in the proxy.
+                if self._client is client:
+                    self._client = None
+                if self._disconnect_timer:
+                    self._disconnect_timer.cancel()
+                    self._disconnect_timer = None
+                try:
+                    if client.is_connected:
+                        await client.disconnect()
+                except Exception:
+                    LOGGER.debug("%s: Could not close incomplete BLE connection", self.name, exc_info=True)
+                raise
 
     def _notification_handler(self, _sender: int, data: bytearray) -> None:
         """Handle notification responses."""
@@ -861,39 +930,123 @@ class BLEDOMInstance:
             LOGGER.error("%s: Could not find write characteristic: %s", self.name, write_uuid)
         
         # For devices like MELK that don't use notifications, only write_uuid is required
-        if self._device.name.lower().startswith("melk") or self._device.name.lower().startswith("modelx"):
+        if self.name.lower().startswith("melk") or self.name.lower().startswith("modelx"):
             result = bool(self._write_uuid)
             LOGGER.debug("%s: Device doesn't require read UUID, resolved: %s", self.name, result)
             return result
         
         return bool(self._read_uuid and self._write_uuid)
 
+    def start(self) -> None:
+        """Start background connection maintenance if persistent mode is selected."""
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Schedule at most one worker; ordinary timeout mode is unchanged."""
+        if self._stopping or self._delay != 0:
+            return
+        if self._client and self._client.is_connected:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self._hass.async_create_background_task(
+            self._reconnect_loop(), f"{self.name} BLE background reconnect"
+        )
+
+    async def _reconnect_loop(self) -> None:
+        """Try to restore a lost link in the background with bounded backoff."""
+        try:
+            for attempt in range(1, BACKGROUND_RECONNECT_ATTEMPTS + 1):
+                if self._stopping:
+                    return
+                try:
+                    # Foreground commands and this worker share _connect_lock.
+                    await self._ensure_connected()
+                    if self._client and self._client.is_connected:
+                        LOGGER.debug("%s: Background BLE connection restored", self.name)
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    LOGGER.debug(
+                        "%s: Background reconnect attempt %d/%d failed: %s",
+                        self.name, attempt, BACKGROUND_RECONNECT_ATTEMPTS,
+                        error, exc_info=True,
+                    )
+
+                if attempt < BACKGROUND_RECONNECT_ATTEMPTS:
+                    delay = min(
+                        BACKGROUND_RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                        BACKGROUND_RECONNECT_MAX_DELAY,
+                    )
+                    LOGGER.debug(
+                        "%s: Retrying background BLE connection in %ds (%d/%d)",
+                        self.name, delay, attempt, BACKGROUND_RECONNECT_ATTEMPTS,
+                    )
+                    await asyncio.sleep(delay)
+            LOGGER.warning(
+                "%s: Background BLE connection failed after %d attempts; "
+                "the next command will retry",
+                self.name, BACKGROUND_RECONNECT_ATTEMPTS,
+            )
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
+
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
+            self._disconnect_timer = None
         self._expected_disconnect = False
-        if self._delay is not None and self._delay != 0:
+        if not self._stopping and self._delay is not None and self._delay != 0:
             LOGGER.debug("%s: Configured disconnect from device in %s seconds; RSSI: %s", self.name, self._delay, self.rssi)
             self._disconnect_timer = self.loop.call_later(
                 self._delay, self._disconnect
             )
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Disconnected callback."""
-        if self._expected_disconnect:
-            LOGGER.debug("%s: Disconnected from device; RSSI: %s", self.name, self.rssi)
+        """Bridge Bleak's callback safely onto Home Assistant's event loop."""
+        if not self._stopping and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._handle_disconnection, client)
+
+    def _handle_disconnection(self, client: BleakClientWithServiceCache) -> None:
+        """Ignore callbacks from old clients and reconnect unexpectedly lost links."""
+        if self._stopping or self._expected_disconnect:
             return
-        LOGGER.warning("%s: Device unexpectedly disconnected; RSSI: %s",self.name,self.rssi,)
+        if client is not self._client:
+            LOGGER.debug("%s: Ignoring disconnect from obsolete BLE client", self.name)
+            return
+        LOGGER.warning("%s: Device unexpectedly disconnected; RSSI: %s", self.name, self.rssi)
+        self._client = None
+        if self._disconnect_timer:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+        self._schedule_reconnect()
 
     def _disconnect(self) -> None:
-        """Disconnect from device."""
+        """Schedule an intentional timeout disconnect."""
         self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
+        if not self._stopping:
+            self._timed_disconnect_task = self._hass.async_create_background_task(
+                self._execute_timed_disconnect(),
+                f"{self.name} BLE timed disconnect",
+            )
 
     async def stop(self) -> None:
-        """Stop the LEDBLE."""
+        """Cancel background work and disconnect on unload or HA shutdown."""
         LOGGER.debug("%s: Stop", self.name)
+        self._stopping = True
+        if self._disconnect_timer:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+        for task in (self._reconnect_task, self._timed_disconnect_task):
+            if task and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._reconnect_task = None
+        self._timed_disconnect_task = None
         await self._execute_disconnect()
 
     async def _execute_timed_disconnect(self) -> None:
@@ -904,10 +1057,11 @@ class BLEDOMInstance:
             self._delay,
         )
         await self._execute_disconnect()
+
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
         async with self._connect_lock:
-            read_char = self._read_uuid if hasattr(self, '_read_uuid') else None
+            read_char = self._read_uuid
             client = self._client
             LOGGER.debug("Disconnecting: READ_UUID=%s, CLIENT_CONNECTED=%s", read_char, client.is_connected if client else "No Client")
             self._expected_disconnect = True
@@ -916,7 +1070,7 @@ class BLEDOMInstance:
             self._read_uuid = None
             if client and client.is_connected:
                 try:
-                    if read_char and not self._device.name.lower().startswith("melk") and not self._device.name.lower().startswith("ledble"):
+                    if read_char and not self.name.lower().startswith("melk") and not self.name.lower().startswith("ledble"):
                         await client.stop_notify(read_char)
                     await client.disconnect()
                 except Exception as e:

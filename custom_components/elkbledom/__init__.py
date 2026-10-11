@@ -42,10 +42,12 @@ SERVICE_SET_RGB_COLOR_SCHEMA = vol.Schema({
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ElkBLEDOM from a config entry."""
-    reset = entry.options.get(CONF_RESET, None) or entry.data.get(CONF_RESET, None)
-    delay = entry.options.get(CONF_DELAY, None) or entry.data.get(CONF_DELAY, None)
-    mac = entry.options.get(CONF_MAC, None) or entry.data.get(CONF_MAC, None)
-    forced_model = entry.options.get(CONF_MODEL, None) or entry.data.get(CONF_MODEL, None)
+    # Values such as 0 (persistent connection) and False are valid options.
+    # Do not use `or` here: it silently falls back to older entry data.
+    reset = entry.options.get(CONF_RESET, entry.data.get(CONF_RESET))
+    delay = entry.options.get(CONF_DELAY, entry.data.get(CONF_DELAY))
+    mac = entry.options.get(CONF_MAC, entry.data.get(CONF_MAC))
+    forced_model = entry.options.get(CONF_MODEL, entry.data.get(CONF_MODEL))
     LOGGER.debug("Config: Reset: %s, Delay: %s, Mac: %s, Forced Model: %s", reset, delay, mac, forced_model)
 
     # Ensure models are loaded (will reuse if already in hass.data)
@@ -56,6 +58,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
    
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # Background reconnect is opt-in through an existing delay=0 setting.
+    # Start only after the entities have been forwarded successfully.
+    instance.start()
 
     async def _async_stop(event: Event) -> None:
         """Close the connection."""
@@ -140,10 +145,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         instance = hass.data[DOMAIN][entry.entry_id]
         await instance.stop()
+        hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
-    instance = hass.data[DOMAIN][entry.entry_id]
-    if entry.title != instance.name:
-        await hass.config_entries.async_reload(entry.entry_id)
+    # Reload all option changes, including disconnect delay and forced model.
+    await hass.config_entries.async_reload(entry.entry_id)
